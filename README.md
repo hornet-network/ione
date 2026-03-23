@@ -1,9 +1,5 @@
 # Ione
 
-[![Build Status](https://travis-ci.org/iconara/ione.png?branch=master)](https://travis-ci.org/iconara/ione)
-[![Coverage Status](https://coveralls.io/repos/iconara/ione/badge.png)](https://coveralls.io/r/iconara/ione)
-[![Blog](http://b.repl.ca/v1/blog-ione-ff69b4.png)](http://architecturalatrocities.com/tagged/ione)
-
 _If you're reading this on GitHub, please note that this is the readme for the development version and that some features described here might not yet have been released. You can find the readme for a specific version either through [rubydoc.info](http://rubydoc.info/find/gems?q=ione) or via the release tags ([here is an example](https://github.com/iconara/ione/tree/v1.2.0))._
 
 Ione is a framework for reactive programming in Ruby. It is based on the reactive core of [cql-rb](http://github.com/iconara/cql-rb), the Ruby driver for Cassandra.
