@@ -8,7 +8,7 @@ require 'ione/version'
 Gem::Specification.new do |s|
   s.name          = 'ione'
   s.version       = Ione::VERSION.dup
-  s.authors       = ['Theo Hultberg']
+  s.authors       = ['Theo Hultberg Tolv']
   s.email         = ['theo@iconara.net']
   s.homepage      = 'http://github.com/iconara/ione'
   s.summary       = %q{Reactive programming framework for Ruby}
@@ -20,5 +20,5 @@ Gem::Specification.new do |s|
   s.require_paths = %w(lib)
 
   s.platform = Gem::Platform::RUBY
-  s.required_ruby_version = '>= 1.9.3'
+  s.required_ruby_version = '>= 3.4.0'
 end
