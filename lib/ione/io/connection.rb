@@ -7,12 +7,14 @@ module Ione
     # @since v1.0.0
     class Connection < BaseConnection
       attr_reader :connection_timeout
+      attr_reader :deadline
 
       # @private
       def initialize(host, port, connection_timeout, unblocker, clock, socket_impl=Socket)
         super(host, port, unblocker)
         @connection_timeout = connection_timeout
         @clock = clock
+        @deadline = @clock.now + connection_timeout unless connection_timeout == Float::INFINITY
         @socket_impl = socket_impl
         @addrinfos = nil
         @connected_promise = Promise.new
@@ -21,6 +23,13 @@ module Ione
 
       # @private
       def connect
+        return @connected_promise.future if closed?
+
+        if @deadline && !connected? && @clock.now >= @deadline
+          close(ConnectionTimeoutError.new("Could not connect to #{@host}:#{@port} within #{@connection_timeout}s"))
+          return @connected_promise.future
+        end
+
         begin
           unless @addrinfos
             @connection_started_at = @clock.now

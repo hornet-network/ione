@@ -25,8 +25,8 @@ module Ione
       shared_context 'running_reactor' do
         before do
           selector.handler do |readables, writables, _, _|
-            writables.each do |writable|
-              fake_connected(writable)
+            (readables + writables).uniq.each do |connection|
+              fake_connected(connection) if connection.connecting?
             end
             [[], writables, []]
           end
@@ -778,18 +778,14 @@ module Ione
           loop_body.tick
         end
 
-        it 'does nothing when IO.select raises Errno::EBADF' do
-          selector.should_receive(:select) do
-            raise Errno::EBADF
+        [Errno::EBADF, IOError].each do |error_class|
+          it "propagates #{error_class} when all selected descriptors are valid" do
+            healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
+            selector.should_receive(:select).and_raise(error_class)
+            expect { healthy_loop.tick }.to raise_error(error_class)
+          ensure
+            healthy_loop.close_sockets if healthy_loop
           end
-          loop_body.tick
-        end
-
-        it 'does nothing when IO.select raises IOError' do
-          selector.should_receive(:select) do
-            raise IOError
-          end
-          loop_body.tick
         end
 
         it 'calls #read on all readable sockets returned by the selector' do
