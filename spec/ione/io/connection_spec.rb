@@ -276,6 +276,45 @@ module Ione
             handler.connect
             error.should be_a(ConnectionTimeoutError)
           end
+
+          it 'connects when the socket reports EISCONN after the deadline has passed' do
+            f = handler.connect
+            socket.stub(:connect_nonblock).and_raise(Errno::EISCONN)
+            socket.should_not_receive(:close)
+            clock.stub(:now).and_return(7)
+            handler.connect
+            f.should be_resolved
+            handler.should be_connected
+          end
+
+          it 'connects when the socket connects right after the deadline has passed' do
+            f = handler.connect
+            socket.stub(:connect_nonblock)
+            clock.stub(:now).and_return(7)
+            handler.connect
+            f.should be_resolved
+            handler.should be_connected
+          end
+        end
+
+        context 'when #connect_nonblock raises IOError' do
+          before do
+            socket.stub(:connect_nonblock).and_raise(IOError.new('closed stream'))
+          end
+
+          it 'does not raise' do
+            expect { handler.connect }.to_not raise_error
+          end
+
+          it 'fails the returned future with a ConnectionError' do
+            f = handler.connect
+            expect { f.value }.to raise_error(ConnectionError)
+          end
+
+          it 'is closed' do
+            handler.connect
+            handler.should be_closed
+          end
         end
       end
 

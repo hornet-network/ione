@@ -25,14 +25,8 @@ module Ione
       def connect
         return @connected_promise.future if closed?
 
-        if @deadline && !connected? && @clock.now >= @deadline
-          close(ConnectionTimeoutError.new("Could not connect to #{@host}:#{@port} within #{@connection_timeout}s"))
-          return @connected_promise.future
-        end
-
         begin
           unless @addrinfos
-            @connection_started_at = @clock.now
             @addrinfos = @socket_impl.getaddrinfo(@host, @port, nil, Socket::SOCK_STREAM)
           end
           unless @io
@@ -49,7 +43,10 @@ module Ione
           @state = CONNECTED_STATE
           @connected_promise.fulfill(self)
         rescue Errno::EINPROGRESS, Errno::EALREADY
-          if @clock.now - @connection_started_at > @connection_timeout
+          # The deadline is only checked once the socket has reported that it
+          # is still connecting, so a handshake that completed just before the
+          # deadline (EISCONN above) wins over the timeout.
+          if @deadline && @clock.now >= @deadline
             close(ConnectionTimeoutError.new("Could not connect to #{@host}:#{@port} within #{@connection_timeout}s"))
           end
         rescue Errno::EINVAL, Errno::ECONNREFUSED => e
@@ -59,7 +56,9 @@ module Ione
             @io = nil
             retry
           end
-        rescue SystemCallError => e
+        rescue SystemCallError, IOError => e
+          # IOError is raised when the socket is closed from another thread
+          # while a connect attempt is in progress.
           close(e)
         rescue SocketError => e
           close(e) || cleanup_on_close(e)

@@ -574,9 +574,9 @@ module Ione
           raise unless evict_dead_sockets(readables + writables, e)
           return
         end
-        connecting.each { |s| s.connect }
-        r && r.each { |s| s.read if s.connected? }
-        w && w.each { |s| s.flush }
+        connecting.each { |s| dispatch(s, :connect) }
+        r && r.each { |s| dispatch(s, :read) if s.connected? }
+        w && w.each { |s| dispatch(s, :flush) }
       end
 
       def to_s
@@ -584,6 +584,21 @@ module Ione
       end
 
       private
+
+      # A socket closed from another thread between select and the call to
+      # its #connect, #read or #flush raises IOError or EBADF. That only
+      # concerns the one socket, so close it rather than crash the reactor.
+      def dispatch(socket, method)
+        socket.__send__(method)
+      rescue IOError, Errno::EBADF => e
+        close_socket(socket, e)
+      end
+
+      def close_socket(socket, error)
+        socket.is_a?(BaseConnection) ? socket.close(error) : socket.close
+      rescue
+        # The descriptor may already be closed.
+      end
 
       def evict_dead_sockets(sockets, error)
         dead = sockets.uniq.select do |s|
@@ -598,13 +613,7 @@ module Ione
             true
           end
         end
-        dead.each do |s|
-          begin
-            s.is_a?(BaseConnection) ? s.close(error) : s.close
-          rescue
-            # The descriptor may already be closed.
-          end
-        end
+        dead.each { |s| close_socket(s, error) }
         @lock.synchronize { @sockets = @sockets.reject { |s| s.closed? || dead.include?(s) } }
         !dead.empty?
       end

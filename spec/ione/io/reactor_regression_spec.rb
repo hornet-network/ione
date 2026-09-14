@@ -265,6 +265,42 @@ module Ione
 
           expect(unblocker).to have_received(:unblock).once
         end
+
+        it 'wakes up when a connection is closed from another thread' do
+          server = ::TCPServer.new('127.0.0.1', 0)
+          reactor.start.value
+          connection = reactor.connect('127.0.0.1', server.addr[1], 1).value
+          accepted = server.accept
+          unblocker = reactor.instance_variable_get(:@unblocker)
+          allow(unblocker).to receive(:unblock).and_call_original
+          sleep(0.1)
+          calls = selector.calls
+
+          connection.close
+
+          expect(unblocker).to have_received(:unblock)
+          await { selector.calls > calls }
+          # the reactor no longer holds the descriptor open, so the peer sees
+          # EOF without waiting for a timer or another connection to wake it
+          expect(::Timeout.timeout(2) { accepted.read }).to eq('')
+        ensure
+          accepted.close if accepted && !accepted.closed?
+          server.close if server && !server.closed?
+        end
+
+        it 'wakes up when an acceptor is closed from another thread' do
+          reactor.start.value
+          acceptor = reactor.bind('127.0.0.1', 0, 5).value
+          unblocker = reactor.instance_variable_get(:@unblocker)
+          allow(unblocker).to receive(:unblock).and_call_original
+          sleep(0.1)
+          calls = selector.calls
+
+          acceptor.close
+
+          expect(unblocker).to have_received(:unblock)
+          await { selector.calls > calls }
+        end
       end
 
       describe('TLS handshake') do
@@ -555,19 +591,44 @@ module Ione
     end
 
     describe(Connection) do
+      let(:clock) { double('clock', now: 100.0) }
+      let(:socket) { double('socket', close: nil) }
+      let(:socket_impl) do
+        impl = double('socket_impl')
+        allow(impl).to receive(:getaddrinfo).and_return([[nil, 9042, nil, '127.0.0.1', ::Socket::AF_INET, ::Socket::SOCK_STREAM]])
+        allow(impl).to receive(:sockaddr_in).and_return('SOCKADDR')
+        allow(impl).to receive(:new).and_return(socket)
+        impl
+      end
+      let(:connection) do
+        Connection.new('127.0.0.1', 9042, 0.25, double('unblocker', unblock: nil), clock, socket_impl)
+      end
+
       it 'fails at the connect deadline without waiting for another polling tick' do
-        clock = double('clock', now: 100.0)
-        connection = Connection.new('127.0.0.1', 9042, 0.25, nil, clock)
+        allow(socket).to receive(:connect_nonblock).and_raise(Errno::EINPROGRESS)
+        future = connection.connect
         allow(clock).to receive(:now).and_return(100.25)
 
-        expect { connection.connect.value }.to raise_error(Ione::Io::ConnectionTimeoutError)
+        connection.connect
+        expect { future.value }.to raise_error(Ione::Io::ConnectionTimeoutError)
         expect(connection).to be_closed
+      end
+
+      it 'prefers a completed connect over the deadline' do
+        allow(socket).to receive(:connect_nonblock).and_raise(Errno::EINPROGRESS)
+        future = connection.connect
+        allow(socket).to receive(:connect_nonblock).and_raise(Errno::EISCONN)
+        allow(clock).to receive(:now).and_return(100.25)
+
+        connection.connect
+        expect(future).to be_resolved
+        expect(connection).to be_connected
       end
     end
 
     describe(SslConnection) do
       it 'fails the handshake without raising when the raw socket has disappeared' do
-        connection = SslConnection.new('127.0.0.1', 9042, nil, nil, nil,
+        connection = SslConnection.new('127.0.0.1', 9042, nil, double('unblocker', unblock: nil), nil,
                                                   deadline: ::Time.now + 1, clock: ::Time)
         future = connection.connect
 
@@ -579,7 +640,7 @@ module Ione
 
       it 'closes the raw socket when closed before the handshake starts' do
         reader, writer = ::IO.pipe
-        connection = SslConnection.new('127.0.0.1', 9042, reader, nil, nil,
+        connection = SslConnection.new('127.0.0.1', 9042, reader, double('unblocker', unblock: nil), nil,
                                                   deadline: ::Time.now + 1, clock: ::Time)
         expect(connection.close).to eq(true)
         expect(reader).to be_closed

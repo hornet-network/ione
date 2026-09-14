@@ -25,9 +25,9 @@ module Ione
 
       def connect
         return @connected_promise.future if closed? || connected?
-        fail_if_past_deadline
-        return @connected_promise.future if closed?
 
+        # The deadline is only checked when the handshake reports that it is
+        # still pending, so a handshake that completes on this attempt wins.
         if @io.nil?
           @io = @ssl_context ? @socket_impl.new(@raw_io, @ssl_context) : @socket_impl.new(@raw_io)
           @io.sync_close = true if @io.respond_to?(:sync_close=)
