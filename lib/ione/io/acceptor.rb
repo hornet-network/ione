@@ -74,6 +74,9 @@ module Ione
             @io = nil
           end
         end
+        # Wake the reactor so it stops selecting on the closed descriptor,
+        # otherwise the listening port can stay bound until the next wakeup.
+        @unblocker.unblock
         true
       end
 
@@ -111,6 +114,13 @@ module Ione
         connection = ServerConnection.new(client_socket, host, port, @unblocker)
         @reactor.accept(connection)
         notify_accept_listeners(connection)
+      rescue IOError, Errno::EBADF
+        # the listening socket was closed from another thread while the
+        # reactor was about to accept on it
+        close
+      rescue SystemCallError
+        # a transient accept error (e.g. ECONNABORTED or a spurious wakeup),
+        # the acceptor stays registered and tries again on the next tick
       end
 
       if RUBY_ENGINE == 'jruby'

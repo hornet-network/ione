@@ -15,7 +15,7 @@ module Ione
       end
 
       let :unblocker do
-        double(:unblocker)
+        double(:unblocker, unblock: nil)
       end
 
       let :reactor do
@@ -125,6 +125,12 @@ module Ione
           socket.should have_received(:close)
         end
 
+        it 'unblocks the reactor so that it stops selecting on the closed socket' do
+          acceptor.bind
+          unblocker.should_receive(:unblock)
+          acceptor.close
+        end
+
         it 'does nothing when called before #bind' do
           acceptor.close
         end
@@ -168,6 +174,24 @@ module Ione
           acceptor.bind
           acceptor.read
           socket.should have_received(:accept_nonblock)
+        end
+
+        [IOError, Errno::EBADF].each do |error_class|
+          it "closes the acceptor when #accept_nonblock raises #{error_class}" do
+            acceptor.bind
+            socket.stub(:accept_nonblock).and_raise(error_class)
+            socket.stub(:close)
+            expect { acceptor.read }.to_not raise_error
+            acceptor.should be_closed
+          end
+        end
+
+        it 'stays open when #accept_nonblock raises a transient error' do
+          acceptor.bind
+          socket.stub(:accept_nonblock).and_raise(Errno::ECONNABORTED)
+          expect { acceptor.read }.to_not raise_error
+          acceptor.should_not be_closed
+          accepted_handlers.should be_empty
         end
 
         it 'creates a new connection handler and registers it with the reactor' do

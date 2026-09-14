@@ -25,8 +25,8 @@ module Ione
       shared_context 'running_reactor' do
         before do
           selector.handler do |readables, writables, _, _|
-            writables.each do |writable|
-              fake_connected(writable)
+            (readables + writables).uniq.each do |connection|
+              fake_connected(connection) if connection.connecting?
             end
             [[], writables, []]
           end
@@ -778,18 +778,14 @@ module Ione
           loop_body.tick
         end
 
-        it 'does nothing when IO.select raises Errno::EBADF' do
-          selector.should_receive(:select) do
-            raise Errno::EBADF
+        [Errno::EBADF, IOError].each do |error_class|
+          it "propagates #{error_class} when all selected descriptors are valid" do
+            healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
+            selector.should_receive(:select).and_raise(error_class)
+            expect { healthy_loop.tick }.to raise_error(error_class)
+          ensure
+            healthy_loop.close_sockets if healthy_loop
           end
-          loop_body.tick
-        end
-
-        it 'does nothing when IO.select raises IOError' do
-          selector.should_receive(:select) do
-            raise IOError
-          end
-          loop_body.tick
         end
 
         it 'calls #read on all readable sockets returned by the selector' do
@@ -810,11 +806,47 @@ module Ione
 
         it 'calls #flush on all writable sockets returned by the selector' do
           socket.stub(:writable?).and_return(true)
-          socket.should_receive(:flush)
           selector.stub(:select) do |r, w, _, _|
             [nil, [socket], nil]
           end
+          socket.should_receive(:flush)
           loop_body.tick
+        end
+
+        [IOError, Errno::EBADF].each do |error_class|
+          it "closes a socket whose #read raises #{error_class} instead of crashing" do
+            other_socket = double(:other_socket, connected?: true, connecting?: false, writable?: false, closed?: false)
+            loop_body.add_socket(other_socket)
+            socket.stub(:connected?).and_return(true)
+            socket.stub(:read).and_raise(error_class)
+            socket.should_receive(:close)
+            other_socket.should_receive(:read)
+            selector.stub(:select).and_return([[socket, other_socket], nil, nil])
+            expect { loop_body.tick }.to_not raise_error
+          end
+
+          it "closes a socket whose #connect raises #{error_class} instead of crashing" do
+            socket.stub(:connecting?).and_return(true)
+            socket.stub(:connect).and_raise(error_class)
+            socket.should_receive(:close)
+            selector.stub(:select).and_return([nil, nil, nil])
+            expect { loop_body.tick }.to_not raise_error
+          end
+
+          it "closes a socket whose #flush raises #{error_class} instead of crashing" do
+            socket.stub(:writable?).and_return(true)
+            socket.stub(:flush).and_raise(error_class)
+            socket.should_receive(:close)
+            selector.stub(:select).and_return([nil, [socket], nil])
+            expect { loop_body.tick }.to_not raise_error
+          end
+        end
+
+        it 'propagates errors other than IOError and EBADF raised by a socket' do
+          socket.stub(:connected?).and_return(true)
+          socket.stub(:read).and_raise(RuntimeError.new('bork'))
+          selector.stub(:select).and_return([[socket], nil, nil])
+          expect { loop_body.tick }.to raise_error(RuntimeError, 'bork')
         end
 
         it 'allows the caller to specify a custom timeout' do

@@ -42,6 +42,11 @@ module Ione
             # nothing to do, the socket was most likely already closed
           end
         end
+        # Wake the reactor so it stops selecting on the closed descriptor. On
+        # Linux the kernel keeps the descriptor open while another thread is
+        # blocked in select on it, so an idle reactor would otherwise delay the
+        # close indefinitely.
+        @unblocker.unblock
         if cause && !cause.is_a?(IoError)
           cause = ConnectionClosedError.new(cause.message)
         end

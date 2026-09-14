@@ -6,6 +6,7 @@ require 'net/https'
 require 'logger'
 require 'ione/http_client'
 
+
 module Ione
   describe HttpClient do
     let :port do
@@ -17,15 +18,15 @@ module Ione
     end
 
     let :base_uri do
-      "#{scheme}://#{WEBrick::Utils::getservername}:#{port}"
+      "#{scheme}://localhost:#{port}"
     end
 
     def await_server_start
       attempts = 10
       begin
-        http = Net::HTTP.new(WEBrick::Utils::getservername, port)
-        http.read_timeout = 1
-        http.open_timeout = 1
+        http = Net::HTTP.new('localhost', port)
+        http.open_timeout = 2
+        http.read_timeout = 2
         if scheme == 'https'
           http.use_ssl = true
           http.cert_store = cert_store
@@ -63,21 +64,21 @@ module Ione
 
     shared_examples 'http_requests' do
       it 'sends a GET request' do
-        f = client.get("#{base_uri}/helloworld")
+        f = client.get("#{base_uri}/helloworld", 'Host' => 'localhost')
         response = f.value
         response.status.should eq(200)
         response.body.should eq('Hello, World!')
       end
 
       it 'sends an GET request with parameters' do
-        response = client.get("#{base_uri}/fizzbuzz?n=3").value
+        response = client.get("#{base_uri}/fizzbuzz?n=3", 'Host' => 'localhost').value
         response.body.should eq('buzz')
-        response = client.get("#{base_uri}/fizzbuzz?n=4").value
+        response = client.get("#{base_uri}/fizzbuzz?n=4", 'Host' => 'localhost').value
         response.body.should eq('4')
       end
 
       it 'sends a GET request with headers' do
-        response = client.get("#{base_uri}/helloworld", 'Accept' => 'text/html').value
+        response = client.get("#{base_uri}/helloworld", 'Host' => 'localhost', 'Accept' => 'text/html').value
         response.headers.should include('Content-Type' => 'text/html')
         response.body.should eq('<h1>Hello, World!</h1>')
       end
@@ -121,7 +122,7 @@ module Ione
       end
 
       let :cert_and_key do
-        HttpClientSpec.create_cert(*root_ca_and_key, [['CN', WEBrick::Utils::getservername]])
+        HttpClientSpec.create_cert(*root_ca_and_key, [['CN', 'localhost']])
       end
 
       let :cert do
