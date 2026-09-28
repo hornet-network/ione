@@ -351,6 +351,7 @@ module Ione
       def run(started, stopped)
         error = nil
         begin
+          @io_loop.claim_thread
           started.fulfill(self)
           while @state == RUNNING_STATE
             @io_loop.tick
@@ -386,9 +387,8 @@ module Ione
       CLOSED_STATE = 2
 
       def initialize
-        @out, @in = IO.pipe
-        @state = BLOCKABLE_STATE
-        @writables = [@in]
+        @lock = Mutex.new
+        open_pipe
       end
 
       def connected?
@@ -396,7 +396,7 @@ module Ione
       end
 
       def reopen
-        initialize if closed?
+        @lock.synchronize { open_pipe if @state == CLOSED_STATE }
       end
 
       def connecting?
@@ -411,8 +411,24 @@ module Ione
         @state == CLOSED_STATE
       end
 
+      def deadline
+        nil
+      end
+
+      def handshake_wants_read?
+        false
+      end
+
+      def handshake_wants_write?
+        false
+      end
+
+      # The state transition and the write are under the same lock as #close,
+      # so that a thread already past the state check cannot be left holding a
+      # pipe that #close has just swapped out from under it.
       def unblock
-        if @state == BLOCKABLE_STATE
+        @lock.synchronize do
+          return if @state != BLOCKABLE_STATE
           @state = UNBLOCKING_STATE
           @in.write_nonblock(PING_BYTE)
         end
@@ -423,19 +439,25 @@ module Ione
       end
 
       def read
-        @out.read_nonblock(65536)
-        @state = BLOCKABLE_STATE
+        @lock.synchronize do
+          return if @state == CLOSED_STATE
+          @out.read_nonblock(65536)
+          @state = BLOCKABLE_STATE
+        end
       rescue IOError
         $stderr.puts('Oh noes we read from the unblocker after it got closed, probably')
       end
 
       def close
-        return if @state == CLOSED_STATE
-        @state = CLOSED_STATE
-        @in.close
-        @out.close
-        @in = nil
-        @out = nil
+        @lock.synchronize do
+          return if @state == CLOSED_STATE
+          @state = CLOSED_STATE
+          # The descriptors are closed but the IO objects are kept. A
+          # concurrent #unblock or #to_io then sees a closed stream, which is
+          # handled, rather than a nil, which would not be.
+          @in.close
+          @out.close
+        end
       end
 
       def drain
@@ -450,6 +472,11 @@ module Ione
       end
 
       private
+
+      def open_pipe
+        @out, @in = IO.pipe
+        @state = BLOCKABLE_STATE
+      end
 
       PING_BYTE = "\0".freeze
     end
@@ -484,15 +511,35 @@ module Ione
     class IoLoopBody
       attr_reader :thread
 
+      # How many times select may fail without any socket being identified as
+      # the cause before the error is treated as fatal. The reactor has always
+      # tolerated these, but tolerating them forever would let a permanently
+      # broken selector spin silently.
+      MAX_UNATTRIBUTED_SELECT_ERRORS = 10
+
       def initialize(unblocker, options={})
         @selector = options[:selector] || IO
         @clock = options[:clock] || Time
-        @timeout = options[:tick_resolution] || 1
-        @idle_timeout = options[:tick_resolution]
+        # Both come from :tick_resolution and they are not interchangeable.
+        # The drain tick must never be nil, or shutdown could block forever
+        # waiting for a socket that has nothing left to write. The idle poll
+        # must stay nil by default, because that is what lets an idle reactor
+        # sleep in select until something actually happens.
+        @drain_tick_timeout = options[:tick_resolution] || 1
+        @idle_poll_timeout = options[:tick_resolution]
         @scheduler = options[:scheduler] || Scheduler.new(options)
         @drain_timeout = options[:drain_timeout] || 5
         @lock = Mutex.new
+        @unblocker = unblocker
         @sockets = [unblocker]
+        @unattributed_select_errors = 0
+      end
+
+      # Called once by the reactor thread when a run begins. Thread identity
+      # changes once per run, so it does not belong in #tick.
+      def claim_thread
+        @thread = Thread.current
+        @thread.name = IoReactor::THREAD_NAME if @thread.name.nil?
       end
 
       def add_socket(socket)
@@ -514,7 +561,7 @@ module Ione
         threshold = @clock.now + @drain_timeout
         until @clock.now >= threshold || @sockets.none?(&:writable?)
           @sockets.each(&:drain)
-          tick(@timeout)
+          tick(@drain_tick_timeout)
           @lock.synchronize { @sockets = @sockets.reject(&:closed?) }
         end
         if @clock.now >= threshold
@@ -535,43 +582,39 @@ module Ione
 
       # An explicit timeout keeps shutdown draining independent of timers.
       def tick(timeout=nil)
-        @thread = Thread.current
-        @thread.name = IoReactor::THREAD_NAME if @thread.name.nil?
-
         readables = []
         writables = []
         connecting = []
         @sockets.each do |s|
           if s.connected?
             readables << s
+            writables << s if s.writable?
           elsif s.connecting?
             connecting << s
-            if s.respond_to?(:handshake_wants_read?) && s.handshake_wants_read?
-              readables << s
-              next
-            end
-          end
-          if s.connecting? || s.writable?
+            # Watch exactly the direction the connect or handshake is waiting
+            # for. Watching for writability while a TLS handshake waits to read
+            # makes select return immediately, every time, forever.
+            readables << s if s.handshake_wants_read?
+            writables << s if s.handshake_wants_write?
+          elsif s.writable?
             writables << s
           end
         end
 
-        unless timeout
-          deadlines = connecting.map do |s|
-            if s.respond_to?(:deadline)
-              deadline = s.deadline
-              [deadline - @clock.now, 0].max if deadline
-            else
-              @timeout
-            end
-          end
-          timeout = [@scheduler.next_timeout, @idle_timeout, *deadlines].compact.min
-        end
+        timeout ||= next_timeout(connecting)
 
         begin
           r, w, _ = @selector.select(readables, writables, nil, timeout)
+          @unattributed_select_errors = 0
         rescue IOError, Errno::EBADF, TypeError => e
-          raise unless evict_dead_sockets(readables + writables, e)
+          # A socket closed from another thread makes select raise. Evict it and
+          # carry on; the reactor as a whole is still healthy.
+          if evict_dead_sockets(readables + writables, e)
+            @unattributed_select_errors = 0
+          else
+            @unattributed_select_errors += 1
+            raise if @unattributed_select_errors > MAX_UNATTRIBUTED_SELECT_ERRORS
+          end
           return
         end
         connecting.each { |s| dispatch(s, :connect) }
@@ -584,6 +627,17 @@ module Ione
       end
 
       private
+
+      # How long select may sleep: until the next timer, the next connect
+      # deadline, or the idle poll interval if one was configured, whichever
+      # comes first. Nil means sleep until a socket or the unblocker wakes us.
+      def next_timeout(connecting)
+        deadlines = connecting.map do |s|
+          deadline = s.deadline
+          [deadline - @clock.now, 0].max if deadline
+        end
+        [@scheduler.next_timeout, @idle_poll_timeout, *deadlines].compact.min
+      end
 
       # A socket closed from another thread between select and the call to
       # its #connect, #read or #flush raises IOError or EBADF. That only
@@ -601,21 +655,38 @@ module Ione
       end
 
       def evict_dead_sockets(sockets, error)
-        dead = sockets.uniq.select do |s|
-          next true if s.closed?
-          begin
-            io = s.to_io
-            next true if io.nil? || io.closed?
-            # Another IO wrapper may close the descriptor while closed? is false.
-            IO.select([io], nil, nil, 0)
-            false
-          rescue IOError, Errno::EBADF, TypeError
-            true
-          end
-        end
+        dead = sockets.uniq.select { |s| dead_socket?(s) }
         dead.each { |s| close_socket(s, error) }
         @lock.synchronize { @sockets = @sockets.reject { |s| s.closed? || dead.include?(s) } }
+        restore_unblocker
         !dead.empty?
+      end
+
+      # Deliberately asks the kernel through IO.select rather than the injected
+      # @selector: the question is whether this descriptor is still valid, not
+      # what the reactor's selector thinks of it, and the selector that just
+      # raised is the least trustworthy thing to ask. Only evidence about this
+      # particular socket counts as dead; anything else leaves it alone, so one
+      # odd socket cannot get every other socket closed.
+      def dead_socket?(socket)
+        return true if socket.closed?
+        io = socket.to_io
+        return true if io.nil? || io.closed?
+        IO.select([io], nil, nil, 0)
+        false
+      rescue IOError, Errno::EBADF
+        true
+      rescue StandardError
+        false
+      end
+
+      # The unblocker is the one socket the reactor cannot run without. If it
+      # is ever evicted, select would sleep with nothing able to wake it and
+      # IoReactor#stop could never complete.
+      def restore_unblocker
+        return if @sockets.include?(@unblocker)
+        @unblocker.reopen
+        add_socket(@unblocker)
       end
     end
 

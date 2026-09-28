@@ -42,6 +42,10 @@ module Ione
       before do
         socket.stub(:connect_nonblock)
         socket.stub(:close)
+        # A successful connect leaves no error on the socket.
+        socket.stub(:getsockopt)
+          .with(Socket::SOL_SOCKET, Socket::SO_ERROR)
+          .and_return(double(:optval, int: 0))
       end
 
       it_behaves_like 'a connection' do
@@ -117,6 +121,44 @@ module Ione
           end
 
           include_examples 'on successfull connection'
+        end
+
+        context 'when #connect_nonblock raises EISCONN but the socket carries an error' do
+          # BSD-derived platforms report EISCONN for every attempt after an
+          # asynchronous connect has already failed, so EISCONN on its own is
+          # not evidence that the connection was established.
+          before do
+            socket_impl.stub(:sockaddr_in)
+              .with('PORT', 'IP2')
+              .and_return('SOCKADDR2')
+            socket_impl.stub(:new)
+              .with('FAMILY2', 'TYPE2', 0)
+              .and_return(socket)
+            socket.stub(:connect_nonblock).and_raise(Errno::EISCONN)
+            socket.stub(:getsockopt)
+              .with(Socket::SOL_SOCKET, Socket::SO_ERROR)
+              .and_return(double(:optval, int: Errno::ECONNREFUSED::Errno))
+          end
+
+          it 'does not report the connection as connected' do
+            handler.connect
+            handler.should_not be_connected
+          end
+
+          it 'attempts to connect to the next address given by #getaddinfo' do
+            socket_impl.should_receive(:sockaddr_in).with('PORT', 'IP2').and_return('SOCKADDR2')
+            handler.connect
+          end
+
+          it 'fails once there are no more addresses to try' do
+            f = handler.connect
+            expect { f.value }.to raise_error(ConnectionError)
+          end
+
+          it 'closes the socket of each address it gives up on' do
+            socket.should_receive(:close).at_least(:twice)
+            handler.connect
+          end
         end
 
         context 'when #connect_nonblock raises EALREADY' do

@@ -728,7 +728,8 @@ module Ione
       end
 
       let :socket do
-        double(:socket, connected?: false, connecting?: false, writable?: false, closed?: false)
+        double(:socket, connected?: false, connecting?: false, writable?: false, closed?: false,
+                        deadline: nil, handshake_wants_read?: false, handshake_wants_write?: true)
       end
 
       before do
@@ -779,10 +780,20 @@ module Ione
         end
 
         [Errno::EBADF, IOError].each do |error_class|
-          it "propagates #{error_class} when all selected descriptors are valid" do
+          it "tolerates #{error_class} from the selector when no socket can be blamed" do
             healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
             selector.should_receive(:select).and_raise(error_class)
-            expect { healthy_loop.tick }.to raise_error(error_class)
+            expect { healthy_loop.tick }.to_not raise_error
+          ensure
+            healthy_loop.close_sockets if healthy_loop
+          end
+
+          it "raises #{error_class} once the selector keeps failing" do
+            healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
+            selector.stub(:select).and_raise(error_class)
+            expect {
+              (described_class::MAX_UNATTRIBUTED_SELECT_ERRORS + 1).times { healthy_loop.tick }
+            }.to raise_error(error_class)
           ensure
             healthy_loop.close_sockets if healthy_loop
           end
@@ -815,7 +826,8 @@ module Ione
 
         [IOError, Errno::EBADF].each do |error_class|
           it "closes a socket whose #read raises #{error_class} instead of crashing" do
-            other_socket = double(:other_socket, connected?: true, connecting?: false, writable?: false, closed?: false)
+            other_socket = double(:other_socket, connected?: true, connecting?: false, writable?: false, closed?: false,
+                                                 deadline: nil, handshake_wants_read?: false, handshake_wants_write?: true)
             loop_body.add_socket(other_socket)
             socket.stub(:connected?).and_return(true)
             socket.stub(:read).and_raise(error_class)

@@ -468,11 +468,7 @@ module Ione
                        clock: clock, selector: selector, drain_timeout: 3)
       end
 
-      before { @thread_name = ::Thread.current.name }
-      after do
-        io_loop.close_sockets
-        ::Thread.current.name = @thread_name
-      end
+      after { io_loop.close_sockets }
 
       it 'uses a fixed timeout while draining with an overdue timer' do
         timer = scheduler.schedule_timer(-1)
@@ -494,8 +490,9 @@ module Ione
 
       it 'selects only until the nearest connect deadline' do
         [100.25, nil, 102.0].each do |deadline|
-          socket = double('connection', connected?: false, connecting?: true,
-                                        closed?: false, deadline: deadline, connect: nil, close: nil)
+          socket = double('connection', connected?: false, connecting?: true, closed?: false,
+                                        deadline: deadline, connect: nil, close: nil,
+                                        handshake_wants_read?: false, handshake_wants_write?: true)
           io_loop.add_socket(socket)
         end
         scheduler.schedule_timer(0.5)
@@ -505,8 +502,9 @@ module Ione
       end
 
       it 'selects without a deadline for an infinite timeout' do
-        socket = double('connection', connected?: false, connecting?: true,
-                                      closed?: false, deadline: nil, connect: nil, close: nil)
+        socket = double('connection', connected?: false, connecting?: true, closed?: false,
+                                      deadline: nil, connect: nil, close: nil,
+                                      handshake_wants_read?: false, handshake_wants_write?: true)
         io_loop.add_socket(socket)
 
         expect(selector).to receive(:select).with(anything, anything, nil, nil)
@@ -514,8 +512,9 @@ module Ione
       end
 
       it 'honours timers while a connection has an infinite timeout' do
-        socket = double('connection', connected?: false, connecting?: true,
-                                      closed?: false, deadline: nil, connect: nil, close: nil)
+        socket = double('connection', connected?: false, connecting?: true, closed?: false,
+                                      deadline: nil, connect: nil, close: nil,
+                                      handshake_wants_read?: false, handshake_wants_write?: true)
         io_loop.add_socket(socket)
         scheduler.schedule_timer(0.25)
 
@@ -524,8 +523,9 @@ module Ione
       end
 
       it 'lets an earlier timer bound select while connecting' do
-        socket = double('connection', connected?: false, connecting?: true,
-                                      closed?: false, deadline: 105.0, connect: nil, close: nil)
+        socket = double('connection', connected?: false, connecting?: true, closed?: false,
+                                      deadline: 105.0, connect: nil, close: nil,
+                                      handshake_wants_read?: false, handshake_wants_write?: true)
         io_loop.add_socket(socket)
         scheduler.schedule_timer(0.1)
 
@@ -584,15 +584,32 @@ module Ione
         end
       end
 
-      it 'propagates select errors unrelated to dead sockets' do
+      it 'tolerates a select error that cannot be blamed on a socket' do
         expect(selector).to receive(:select).and_raise(::TypeError, 'bad selector argument')
-        expect { io_loop.tick }.to raise_error(::TypeError, 'bad selector argument')
+        expect { io_loop.tick }.not_to raise_error
+      end
+
+      it 'gives up once such an error repeats' do
+        allow(selector).to receive(:select).and_raise(::TypeError, 'bad selector argument')
+        expect {
+          (IoLoopBody::MAX_UNATTRIBUTED_SELECT_ERRORS + 1).times { io_loop.tick }
+        }.to raise_error(::TypeError, 'bad selector argument')
+      end
+
+      it 'keeps the unblocker registered when eviction would have dropped it' do
+        ::IO.for_fd(unblocker.to_io.fileno).close
+        allow(selector).to receive(:select) { |*args| ::IO.select(*args) }
+
+        io_loop.tick
+
+        expect(unblocker).not_to be_closed
+        expect { unblocker.unblock }.not_to raise_error
       end
     end
 
     describe(Connection) do
       let(:clock) { double('clock', now: 100.0) }
-      let(:socket) { double('socket', close: nil) }
+      let(:socket) { double('socket', close: nil, getsockopt: double('optval', int: 0)) }
       let(:socket_impl) do
         impl = double('socket_impl')
         allow(impl).to receive(:getaddrinfo).and_return([[nil, 9042, nil, '127.0.0.1', ::Socket::AF_INET, ::Socket::SOCK_STREAM]])

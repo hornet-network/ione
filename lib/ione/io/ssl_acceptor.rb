@@ -11,8 +11,13 @@ module Ione
         @ssl_socket_impl = ssl_socket_impl
       end
 
-      def read
-        client_socket, host, port = accept
+      private
+
+      # Only the connection construction differs from a plain acceptor, so
+      # #read and its error handling stay in the superclass. Accept listeners
+      # are notified by the connection once the TLS handshake completes rather
+      # than here.
+      def handle_connection(client_socket, host, port)
         connection = SslServerConnection.new(client_socket, host, port, @unblocker, @ssl_context, method(:notify_accept_listeners), @ssl_socket_impl)
         @reactor.accept(connection)
       end

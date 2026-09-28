@@ -12,11 +12,12 @@ module Ione
       attr_reader :host, :port
 
       # @private
-      def initialize(host, port, unblocker)
+      def initialize(host, port, unblocker, clock: Time)
         @host = host
         @port = port
         @io = nil
         @unblocker = unblocker
+        @clock = clock
         @state = CONNECTING_STATE
         @writable = false
         @lock = Mutex.new
@@ -100,6 +101,35 @@ module Ione
       # Returns true if the connection is closed
       def closed?
         @state == CLOSED_STATE
+      end
+
+      # The point in time by which this connection must finish connecting, or
+      # nil when the attempt is unbounded. Subclasses that accept a connection
+      # timeout override this.
+      #
+      # @private
+      def deadline
+        nil
+      end
+
+      # @private
+      def deadline_expired?
+        d = deadline
+        !d.nil? && @clock.now >= d
+      end
+
+      # Which direction the reactor should watch while this connection is
+      # still connecting. A plain socket finishes connecting when it becomes
+      # writable; a TLS handshake alternates between the two.
+      #
+      # @private
+      def handshake_wants_read?
+        false
+      end
+
+      # @private
+      def handshake_wants_write?
+        true
       end
 
       # @private

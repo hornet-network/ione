@@ -11,13 +11,12 @@ module Ione
 
       def initialize(host, port, io, unblocker, ssl_context=nil, socket_impl=OpenSSL::SSL::SSLSocket,
                      deadline: nil, clock: Time)
-        super(host, port, unblocker)
+        super(host, port, unblocker, clock: clock)
         @socket_impl = socket_impl
         @ssl_context = ssl_context
         @raw_io = io
         @io = nil
         @deadline = deadline
-        @clock = clock
         @wants_read = false
         @connected_promise = Promise.new
         on_closed(&method(:cleanup_on_close))
@@ -54,8 +53,26 @@ module Ione
         @raw_io
       end
 
-      def handshake_wants_read?
-        @wants_read
+      if RUBY_ENGINE == 'jruby'
+        # JRuby signals a pending handshake with WaitReadable even when the
+        # handshake still needs to write, so the direction it reports cannot be
+        # used to pick one. Watch both and let the handshake make progress
+        # whichever way the socket becomes ready.
+        def handshake_wants_read?
+          true
+        end
+
+        def handshake_wants_write?
+          true
+        end
+      else
+        def handshake_wants_read?
+          @wants_read
+        end
+
+        def handshake_wants_write?
+          !@wants_read
+        end
       end
 
       def close(cause=nil)
@@ -101,7 +118,7 @@ module Ione
       private
 
       def fail_if_past_deadline
-        return if @deadline.nil? || @clock.now < @deadline
+        return unless deadline_expired?
 
         close(ConnectionTimeoutError.new("Could not complete TLS handshake with #{@host}:#{@port} within the connect timeout"))
       end
