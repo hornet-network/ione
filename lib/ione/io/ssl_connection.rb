@@ -53,26 +53,17 @@ module Ione
         @raw_io
       end
 
-      if RUBY_ENGINE == 'jruby'
-        # JRuby signals a pending handshake with WaitReadable even when the
-        # handshake still needs to write, so the direction it reports cannot be
-        # used to pick one. Watch both and let the handshake make progress
-        # whichever way the socket becomes ready.
-        def handshake_wants_read?
-          true
-        end
+      # The direction the pending handshake is waiting for. This is the same
+      # on JRuby as on MRI: jruby-openssl raises WaitReadable only after it
+      # has written the ClientHello, so watching for readability alone is
+      # correct there too. Watching both directions would make select return
+      # immediately on the always-writable socket and spin the loop.
+      def handshake_wants_read?
+        @wants_read
+      end
 
-        def handshake_wants_write?
-          true
-        end
-      else
-        def handshake_wants_read?
-          @wants_read
-        end
-
-        def handshake_wants_write?
-          !@wants_read
-        end
+      def handshake_wants_write?
+        !@wants_read
       end
 
       def close(cause=nil)
