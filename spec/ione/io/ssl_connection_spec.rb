@@ -16,7 +16,7 @@ module Ione
       end
 
       let :raw_socket do
-        double(:raw_socket)
+        double(:raw_socket, closed?: false, close: nil)
       end
 
       let :ssl_socket do

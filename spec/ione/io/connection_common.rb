@@ -27,6 +27,17 @@ shared_examples_for 'a connection' do |options|
       handler.close
     end
 
+    it 'unblocks the reactor so that it stops selecting on the closed socket' do
+      unblocker.should_receive(:unblock)
+      handler.close
+    end
+
+    it 'does not unblock the reactor when called again' do
+      handler.close
+      unblocker.should_not_receive(:unblock)
+      handler.close
+    end
+
     it 'calls the closed listener' do
       called = false
       handler.on_closed { called = true }
@@ -208,9 +219,9 @@ shared_examples_for 'a connection' do |options|
 
       it 'does not unblock the reactor' do
         handler.close
+        unblocker.should_not_receive(:unblock)
         handler.write('hello world')
         handler.flush
-        unblocker.should_not have_received(:unblock)
       end
     end
 
@@ -232,9 +243,9 @@ shared_examples_for 'a connection' do |options|
 
       it 'does not unblock the reactor' do
         handler.drain
+        unblocker.should_not_receive(:unblock)
         handler.write('hello world')
         handler.flush
-        unblocker.should_not have_received(:unblock)
       end
     end
   end

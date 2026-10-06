@@ -81,6 +81,8 @@ module Ione
     #
     # @since v1.0.0
     class IoReactor
+      THREAD_NAME = 'io_reactor'.freeze
+
       PENDING_STATE = 0
       RUNNING_STATE = 1
       CRASHED_STATE = 2
@@ -96,8 +98,8 @@ module Ione
         @state = PENDING_STATE
         @error_listeners = []
         @unblocker = Unblocker.new
-        @io_loop = IoLoopBody.new(@unblocker, @options)
         @scheduler = Scheduler.new(@options)
+        @io_loop = IoLoopBody.new(@unblocker, @options.merge(scheduler: @scheduler))
         @lock = Mutex.new
       end
 
@@ -136,51 +138,29 @@ module Ione
       #
       # @return [Ione::Future] a future that will resolve to the reactor itself
       def start
-        @lock.synchronize do
-          if @state == RUNNING_STATE
-            return @started_promise.future
-          elsif @state == STOPPING_STATE
-            return @stopped_promise.future.flat_map { start }.fallback { start }
+        stopping = @lock.synchronize do
+          return @started_promise.future if @state == RUNNING_STATE
+
+          if @state == STOPPING_STATE
+            @stopped_promise.future
           else
+            # Connections queued before a restart retain this unblocker.
+            if @unblocker.closed?
+              @unblocker.reopen
+              @io_loop.add_socket(@unblocker)
+            end
+            started = @started_promise = Promise.new
+            stopped = @stopped_promise = Promise.new
+            @error_listeners.each { |listener| stopped.future.on_failure(&listener) }
             @state = RUNNING_STATE
+            Thread.start { run(started, stopped) }
+            return started.future
           end
         end
-        @started_promise = Promise.new
-        @stopped_promise = Promise.new
-        @error_listeners.each do |listener|
-          @stopped_promise.future.on_failure(&listener)
-        end
-        Thread.start do
-          @started_promise.fulfill(self)
-          error = nil
-          begin
-            while @state == RUNNING_STATE
-              @io_loop.tick
-              @scheduler.tick
-            end
-          rescue => e
-            error = e
-          ensure
-            begin
-              begin
-                @io_loop.drain_sockets
-              rescue => ee
-                error ||= ee
-              end
-              @io_loop.close_sockets
-              @scheduler.cancel_timers
-            ensure
-              if error
-                @state = CRASHED_STATE
-                @stopped_promise.fail(error)
-              else
-                @state = STOPPED_STATE
-                @stopped_promise.fulfill(self)
-              end
-            end
-          end
-        end
-        @started_promise.future
+
+        # Completed futures invoke callbacks immediately. Restart outside the
+        # state lock so its callback can acquire the lock again.
+        stopping.flat_map { start }.fallback { start }
       end
 
       # Stops the reactor.
@@ -220,7 +200,8 @@ module Ione
       # @param options [Hash, Numeric] a hash of options (see below)
       #   or the connection timeout (equivalent to using the `:timeout` option).
       # @option options [Numeric] :timeout (5) the number of seconds
-      #   to wait for a connection before failing
+      #   to wait for TCP connection and TLS handshake together before failing;
+      #   Float::INFINITY leaves the connection attempt unbounded
       # @option options [Boolean, OpenSSL::SSL::SSLContext] :ssl (false)
       #   pass an `OpenSSL::SSL::SSLContext` to upgrade the connection to SSL,
       #   or true to upgrade the connection and create a new context.
@@ -243,7 +224,8 @@ module Ione
         if ssl
           f = f.flat_map do
             ssl_context = ssl == true ? nil : ssl
-            upgraded_connection = SslConnection.new(host, port, connection.to_io, @unblocker, ssl_context)
+            upgraded_connection = SslConnection.new(host, port, connection.to_io, @unblocker, ssl_context,
+                                                    deadline: connection.deadline, clock: @clock)
             ff = upgraded_connection.connect
             @io_loop.remove_socket(connection)
             @io_loop.add_socket(upgraded_connection)
@@ -341,7 +323,9 @@ module Ione
       #   future is completed
       # @return [Ione::Future] a future that completes when the timer expires
       def schedule_timer(timeout)
-        @scheduler.schedule_timer(timeout)
+        timer = @scheduler.schedule_timer(timeout)
+        @unblocker.unblock if running? && @io_loop.thread != Thread.current
+        timer
       end
 
       # Cancels a previously scheduled timer.
@@ -361,6 +345,39 @@ module Ione
         state = state_constant_name.to_s.rpartition('_').first
         %(#<#{self.class.name} #{state}>)
       end
+
+      private
+
+      def run(started, stopped)
+        error = nil
+        begin
+          @io_loop.claim_thread
+          started.fulfill(self)
+          while @state == RUNNING_STATE
+            @io_loop.tick
+            @scheduler.tick
+          end
+        rescue => e
+          error = e
+        ensure
+          begin
+            begin
+              @io_loop.drain_sockets
+            rescue => e
+              error ||= e
+            end
+            @io_loop.close_sockets
+            @scheduler.cancel_timers
+          rescue => e
+            error ||= e
+          ensure
+            @lock.synchronize { @state = error ? CRASHED_STATE : STOPPED_STATE }
+            # A new run can start after releasing the lock. Complete only this
+            # run's promise, with callbacks outside the state lock.
+            error ? stopped.fail(error) : stopped.fulfill(self)
+          end
+        end
+      end
     end
 
     # @private
@@ -370,13 +387,16 @@ module Ione
       CLOSED_STATE = 2
 
       def initialize
-        @out, @in = IO.pipe
-        @state = BLOCKABLE_STATE
-        @writables = [@in]
+        @lock = Mutex.new
+        open_pipe
       end
 
       def connected?
         true
+      end
+
+      def reopen
+        @lock.synchronize { open_pipe if @state == CLOSED_STATE }
       end
 
       def connecting?
@@ -391,8 +411,24 @@ module Ione
         @state == CLOSED_STATE
       end
 
+      def deadline
+        nil
+      end
+
+      def handshake_wants_read?
+        false
+      end
+
+      def handshake_wants_write?
+        false
+      end
+
+      # The state transition and the write are under the same lock as #close,
+      # so that a thread already past the state check cannot be left holding a
+      # pipe that #close has just swapped out from under it.
       def unblock
-        if @state == BLOCKABLE_STATE
+        @lock.synchronize do
+          return if @state != BLOCKABLE_STATE
           @state = UNBLOCKING_STATE
           @in.write_nonblock(PING_BYTE)
         end
@@ -403,19 +439,25 @@ module Ione
       end
 
       def read
-        @out.read_nonblock(65536)
-        @state = BLOCKABLE_STATE
+        @lock.synchronize do
+          return if @state == CLOSED_STATE
+          @out.read_nonblock(65536)
+          @state = BLOCKABLE_STATE
+        end
       rescue IOError
         $stderr.puts('Oh noes we read from the unblocker after it got closed, probably')
       end
 
       def close
-        return if @state == CLOSED_STATE
-        @state = CLOSED_STATE
-        @in.close
-        @out.close
-        @in = nil
-        @out = nil
+        @lock.synchronize do
+          return if @state == CLOSED_STATE
+          @state = CLOSED_STATE
+          # The descriptors are closed but the IO objects are kept. A
+          # concurrent #unblock or #to_io then sees a closed stream, which is
+          # handled, rather than a nil, which would not be.
+          @in.close
+          @out.close
+        end
       end
 
       def drain
@@ -430,6 +472,11 @@ module Ione
       end
 
       private
+
+      def open_pipe
+        @out, @in = IO.pipe
+        @state = BLOCKABLE_STATE
+      end
 
       PING_BYTE = "\0".freeze
     end
@@ -462,13 +509,40 @@ module Ione
 
     # @private
     class IoLoopBody
+      attr_reader :thread
+
+      # How many times select may fail without any socket being identified as
+      # the cause before the error is treated as fatal. The reactor has always
+      # tolerated these, but tolerating them forever would let a permanently
+      # broken selector spin silently.
+      MAX_UNATTRIBUTED_SELECT_ERRORS = 10
+
       def initialize(unblocker, options={})
         @selector = options[:selector] || IO
         @clock = options[:clock] || Time
-        @timeout = options[:tick_resolution] || 1
+        # Both come from :tick_resolution and they are not interchangeable.
+        # The drain tick must never be nil, or shutdown could block forever
+        # waiting for a socket that has nothing left to write. The idle poll
+        # must stay nil by default, because that is what lets an idle reactor
+        # sleep in select until something actually happens.
+        @drain_tick_timeout = options[:tick_resolution] || 1
+        @idle_poll_timeout = options[:tick_resolution]
+        @scheduler = options[:scheduler] || Scheduler.new(options)
         @drain_timeout = options[:drain_timeout] || 5
         @lock = Mutex.new
+        @unblocker = unblocker
         @sockets = [unblocker]
+        @unattributed_select_errors = 0
+      end
+
+      # Called once by the reactor thread when a run begins. Thread identity
+      # changes once per run, so it does not belong in #tick, and the select
+      # error budget starts fresh so that errors seen while one run was
+      # shutting down do not count against the next.
+      def claim_thread
+        @thread = Thread.current
+        @thread.name = IoReactor::THREAD_NAME if @thread.name.nil?
+        @unattributed_select_errors = 0
       end
 
       def add_socket(socket)
@@ -490,7 +564,7 @@ module Ione
         threshold = @clock.now + @drain_timeout
         until @clock.now >= threshold || @sockets.none?(&:writable?)
           @sockets.each(&:drain)
-          tick
+          tick(@drain_tick_timeout)
           @lock.synchronize { @sockets = @sockets.reject(&:closed?) }
         end
         if @clock.now >= threshold
@@ -509,31 +583,113 @@ module Ione
         @sockets = []
       end
 
-      def tick
+      # An explicit timeout keeps shutdown draining independent of timers.
+      def tick(timeout=nil)
         readables = []
         writables = []
         connecting = []
         @sockets.each do |s|
           if s.connected?
             readables << s
+            writables << s if s.writable?
           elsif s.connecting?
             connecting << s
-          end
-          if s.connecting? || s.writable?
+            # Watch exactly the direction the connect or handshake is waiting
+            # for. Watching for writability while a TLS handshake waits to read
+            # makes select return immediately, every time, forever.
+            readables << s if s.handshake_wants_read?
+            writables << s if s.handshake_wants_write?
+          elsif s.writable?
             writables << s
           end
         end
+
+        timeout ||= next_timeout(connecting)
+
         begin
-          r, w, _ = @selector.select(readables, writables, nil, @timeout)
-          connecting.each { |s| s.connect }
-          r && r.each { |s| s.read }
-          w && w.each { |s| s.flush }
-        rescue IOError, Errno::EBADF
+          r, w, _ = @selector.select(readables, writables, nil, timeout)
+          @unattributed_select_errors = 0
+        rescue IOError, Errno::EBADF, TypeError => e
+          # A socket closed from another thread makes select raise. Evict it and
+          # carry on; the reactor as a whole is still healthy.
+          if evict_dead_sockets(readables + writables, e)
+            @unattributed_select_errors = 0
+          else
+            @unattributed_select_errors += 1
+            raise if @unattributed_select_errors > MAX_UNATTRIBUTED_SELECT_ERRORS
+          end
+          return
         end
+        connecting.each { |s| dispatch(s, :connect) }
+        r && r.each { |s| dispatch(s, :read) if s.connected? }
+        w && w.each { |s| dispatch(s, :flush) }
       end
 
       def to_s
         %(#<#{IoReactor.name} @connections=[#{@sockets.map(&:to_s).join(', ')}]>)
+      end
+
+      private
+
+      # How long select may sleep: until the next timer, the next connect
+      # deadline, or the idle poll interval if one was configured, whichever
+      # comes first. Nil means sleep until a socket or the unblocker wakes us.
+      def next_timeout(connecting)
+        deadlines = connecting.map do |s|
+          deadline = s.deadline
+          [deadline - @clock.now, 0].max if deadline
+        end
+        [@scheduler.next_timeout, @idle_poll_timeout, *deadlines].compact.min
+      end
+
+      # A socket closed from another thread between select and the call to
+      # its #connect, #read or #flush raises IOError or EBADF. That only
+      # concerns the one socket, so close it rather than crash the reactor.
+      def dispatch(socket, method)
+        socket.__send__(method)
+      rescue IOError, Errno::EBADF => e
+        close_socket(socket, e)
+      end
+
+      def close_socket(socket, error)
+        socket.is_a?(BaseConnection) ? socket.close(error) : socket.close
+      rescue
+        # The descriptor may already be closed.
+      end
+
+      def evict_dead_sockets(sockets, error)
+        dead = sockets.uniq.select { |s| dead_socket?(s) }
+        dead.each { |s| close_socket(s, error) }
+        @lock.synchronize { @sockets = @sockets.reject { |s| s.closed? || dead.include?(s) } }
+        restore_unblocker
+        !dead.empty?
+      end
+
+      # Deliberately asks the kernel through IO.select rather than the injected
+      # @selector: the question is whether this descriptor is still valid, not
+      # what the reactor's selector thinks of it, and the selector that just
+      # raised is the least trustworthy thing to ask. Only evidence about this
+      # particular socket counts as dead; anything else leaves it alone, so one
+      # odd socket cannot get every other socket closed.
+      def dead_socket?(socket)
+        return true if socket.closed?
+        io = socket.to_io
+        return true if io.nil? || io.closed?
+        IO.select([io], nil, nil, 0)
+        false
+      rescue IOError, Errno::EBADF
+        true
+      rescue StandardError
+        false
+      end
+
+      # The unblocker is the one socket the reactor cannot run without. If it
+      # is ever evicted, select would sleep with nothing able to wake it and
+      # IoReactor#stop could never complete.
+      def restore_unblocker
+        return if @sockets.include?(@unblocker)
+        @unblocker.reopen
+        add_socket(@unblocker)
       end
     end
 
@@ -544,6 +700,14 @@ module Ione
         @lock = Mutex.new
         @timer_queue = Heap.new
         @pending_timers = {}
+      end
+
+      # Seconds until the next timer, or nil when there are no pending timers.
+      def next_timeout
+        timer = @lock.synchronize { @timer_queue.peek }
+        return nil unless timer
+
+        [timer.time - @clock.now, 0].max
       end
 
       def schedule_timer(timeout)
