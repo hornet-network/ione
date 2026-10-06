@@ -797,6 +797,7 @@ module Ione
           ensure
             healthy_loop.close_sockets if healthy_loop
           end
+        end
 
         it 'starts each run with a fresh select error budget' do
           healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
