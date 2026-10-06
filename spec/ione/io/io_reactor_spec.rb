@@ -889,6 +889,17 @@ module Ione
           loop_body.close_sockets
         end
 
+        it 'keeps a socket that is registered while the sockets are closing' do
+          late_socket = double(:late_socket, connected?: true, connecting?: false, writable?: false, closed?: false,
+                                             deadline: nil, handshake_wants_read?: false, handshake_wants_write?: true)
+          socket.stub(:close) { loop_body.add_socket(late_socket) }
+          loop_body.add_socket(socket)
+          loop_body.close_sockets
+          late_socket.should_not_receive(:close)
+          selector.should_receive(:select).with([late_socket], anything, anything, anything).and_return([nil, nil, nil])
+          loop_body.tick
+        end
+
         it 'closes all sockets, even when one of them raises an error' do
           socket1 = double(:socket1, closed?: false)
           socket2 = double(:socket2, closed?: false)

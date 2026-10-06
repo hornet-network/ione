@@ -572,15 +572,22 @@ module Ione
         end
       end
 
+      # Takes the same lock as #add_socket and #remove_socket, so a socket
+      # registered while the reactor is shutting down lands in the fresh list
+      # and is carried into the next run instead of being silently dropped.
       def close_sockets
-        @sockets.each do |s|
+        sockets = @lock.synchronize do
+          closing = @sockets
+          @sockets = []
+          closing
+        end
+        sockets.each do |s|
           begin
             s.close
           rescue
             # the socket had most likely already closed due to an error
           end
         end
-        @sockets = []
       end
 
       # An explicit timeout keeps shutdown draining independent of timers.
