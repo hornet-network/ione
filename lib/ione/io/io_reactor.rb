@@ -536,10 +536,13 @@ module Ione
       end
 
       # Called once by the reactor thread when a run begins. Thread identity
-      # changes once per run, so it does not belong in #tick.
+      # changes once per run, so it does not belong in #tick, and the select
+      # error budget starts fresh so that errors seen while one run was
+      # shutting down do not count against the next.
       def claim_thread
         @thread = Thread.current
         @thread.name = IoReactor::THREAD_NAME if @thread.name.nil?
+        @unattributed_select_errors = 0
       end
 
       def add_socket(socket)

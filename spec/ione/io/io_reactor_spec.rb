@@ -797,6 +797,15 @@ module Ione
           ensure
             healthy_loop.close_sockets if healthy_loop
           end
+
+        it 'starts each run with a fresh select error budget' do
+          healthy_loop = described_class.new(Unblocker.new, selector: selector, clock: clock)
+          selector.stub(:select).and_raise(IOError)
+          described_class::MAX_UNATTRIBUTED_SELECT_ERRORS.times { healthy_loop.tick }
+          healthy_loop.claim_thread
+          expect { healthy_loop.tick }.to_not raise_error
+        ensure
+          healthy_loop.close_sockets if healthy_loop
         end
 
         it 'calls #read on all readable sockets returned by the selector' do
